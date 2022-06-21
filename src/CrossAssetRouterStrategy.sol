@@ -10,38 +10,38 @@ import {BaseStrategy, StrategyParams} from "@yearnvaults/contracts/BaseStrategy.
 import {Address} from "@openzeppelin/contracts/utils/Address.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
-// Import interfaces for many popular DeFi projects, or add your own!
-//import "./interfaces/<protocol>/<Interface>.sol";
+import {IERC20Extended} from "./interfaces/ERC20/IERC20Extended.sol";
+import {IVault} from "./interfaces/Vault.sol";
 
-
-
-contract CrossAssetRouterStrategy is BaseStrategy {
+/**
+ * Takes want, swaps it for targetToken, and then deposits targetToken in the yVault.
+ */
+abstract contract CrossAssetRouterStrategy is BaseStrategy {
     using SafeERC20 for IERC20;
     using Address for address;
 
-    string internal strategyName;
-    IVault public yVault;
+    IVault public yVault; // vault that we're depositing into
+    IERC20 public targetToken;
     uint256 public maxLoss;
     bool internal isOriginal = true;
 
-    constructor(
-        address _vault,
-        address _yVault,
-        string memory _strategyName
-    ) public BaseStrategy(_vault) {
-        _initializeThis(_yVault, _strategyName);
-    }
-
     event Cloned(address indexed clone);
 
-    function cloneRouter(
+    constructor(
+        address _vault,
+        address _yVault
+    ) public BaseStrategy(_vault) {
+        _initializeStrategy(_yVault);
+    }
+
+    function clone(
         address _vault,
         address _strategist,
         address _rewards,
         address _keeper,
-        address _yVault,
-        string memory _strategyName
+        address _yVault
     ) external virtual returns (address newStrategy) {
         require(isOriginal);
         // Copied from https://github.com/optionality/clone-factory/blob/master/contracts/CloneFactory.sol
@@ -61,13 +61,12 @@ contract CrossAssetRouterStrategy is BaseStrategy {
             newStrategy := create(0, clone_code, 0x37)
         }
 
-        RouterStrategy(newStrategy).initialize(
+        CrossAssetRouterStrategy(newStrategy).initialize(
             _vault,
             _strategist,
             _rewards,
             _keeper,
-            _yVault,
-            _strategyName
+            _yVault
         );
 
         emit Cloned(newStrategy);
@@ -78,23 +77,33 @@ contract CrossAssetRouterStrategy is BaseStrategy {
         address _strategist,
         address _rewards,
         address _keeper,
-        address _yVault,
-        string memory _strategyName
+        address _yVault
     ) public {
         _initialize(_vault, _strategist, _rewards, _keeper);
         require(address(yVault) == address(0));
-        _initializeThis(_yVault, _strategyName);
+        _initializeStrategy(_yVault);
     }
 
-    function _initializeThis(address _yVault, string memory _strategyName)
+    function _initializeStrategy(address _yVault)
         internal
     {
         yVault = IVault(_yVault);
-        strategyName = _strategyName;
+        targetToken = IERC20(yVault.token());
+
+        want.safeApprove(address(yVault), type(uint256).max);
+
     }
 
     function name() external view override returns (string memory) {
-        return strategyName;
+        string memory _assetSymbols = string(
+            abi.encodePacked(
+                IERC20Extended(address(want)).symbol(),
+                "->",
+                IERC20Extended(address(targetToken)).symbol()
+            )
+        );
+
+        return string(abi.encodePacked("CrossAssetRouterStrategy(", _assetSymbols, ")"));
     }
 
     function estimatedTotalAssets()
@@ -126,13 +135,13 @@ contract CrossAssetRouterStrategy is BaseStrategy {
 
         // Estimate the profit we have so far
         if (_totalDebt <= _totalAsset) {
-            _profit = _totalAsset.sub(_totalDebt);
+            _profit = _totalAsset - _totalDebt;
         }
 
         // We take profit and debt
         uint256 _amountFreed;
         (_amountFreed, _loss) = liquidatePosition(
-            _debtOutstanding.add(_profit)
+            _debtOutstanding + _profit
         );
         _debtPayment = Math.min(_debtOutstanding, _amountFreed);
 
@@ -162,9 +171,9 @@ contract CrossAssetRouterStrategy is BaseStrategy {
             return;
         }
 
-        uint256 balance = balanceOfWant();
-        if (balance > 0) {
-            _checkAllowance(address(yVault), address(want), balance);
+        uint256 _freeBalance = balanceOfWant();
+        if (_freeBalance > _debtOutstanding) {
+            uint256 _amountToInvest = _freeBalance - _debtOutstanding;
             yVault.deposit();
         }
     }
@@ -175,18 +184,18 @@ contract CrossAssetRouterStrategy is BaseStrategy {
         override
         returns (uint256 _liquidatedAmount, uint256 _loss)
     {
-        uint256 balance = balanceOfWant();
-        if (balance >= _amountNeeded) {
+        uint256 _looseWant = balanceOfWant();
+        if (_looseWant >= _amountNeeded) {
             return (_amountNeeded, 0);
         }
 
-        uint256 toWithdraw = _amountNeeded.sub(balance);
-        _withdrawFromYVault(toWithdraw);
+        uint256 _toWithdraw = _amountNeeded.sub(_looseWant);
+        _withdrawFromYVault(_toWithdraw);
 
-        uint256 looseWant = balanceOfWant();
-        if (_amountNeeded > looseWant) {
-            _liquidatedAmount = looseWant;
-            _loss = _amountNeeded.sub(looseWant);
+        _looseWant = balanceOfWant();
+        if (_amountNeeded > _looseWant) {
+            _liquidatedAmount = _looseWant;
+            _loss = _amountNeeded - _looseWant;
         } else {
             _liquidatedAmount = _amountNeeded;
         }
@@ -198,14 +207,14 @@ contract CrossAssetRouterStrategy is BaseStrategy {
         }
 
         uint256 _balanceOfYShares = yVault.balanceOf(address(this));
-        uint256 sharesToWithdraw =
+        uint256 _sharesToWithdraw =
             Math.min(_investmentTokenToYShares(_amount), _balanceOfYShares);
 
-        if (sharesToWithdraw == 0) {
+        if (_sharesToWithdraw == 0) {
             return;
         }
 
-        yVault.withdraw(sharesToWithdraw, address(this), maxLoss);
+        yVault.withdraw(_sharesToWithdraw, address(this), maxLoss);
     }
 
     function liquidateAllPositions()
@@ -223,9 +232,9 @@ contract CrossAssetRouterStrategy is BaseStrategy {
     }
 
     function prepareMigration(address _newStrategy) internal virtual override {
-        IERC20(yVault).safeTransfer(
+        yVault.safeTransfer(
             _newStrategy,
-            IERC20(yVault).balanceOf(address(this))
+            yVault.balanceOf(address(this))
         );
     }
 
@@ -234,10 +243,7 @@ contract CrossAssetRouterStrategy is BaseStrategy {
         view
         override
         returns (address[] memory ret)
-    {
-        ret = new address[](1);
-        ret[0] = address(yVault);
-    }
+    {}
 
     function ethToWant(uint256 _amtInWei)
         public
